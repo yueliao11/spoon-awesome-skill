@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, TYPE_CHECKING, Any, Set
 
 if TYPE_CHECKING:
-    from spoon_ai.chat import Message  # type: ignore
+    pass  # type: ignore
 
 from .config import RagConfig
 from .retriever import RetrievedChunk
@@ -134,11 +134,12 @@ class RagQA:
         prompt = self.user_template.format(context=context, question=question)
 
         # Lazy import to avoid circular dependency
-        from spoon_ai.chat import Message  # type: ignore
+        # Lazy import to avoid circular dependency
+        # from spoon_ai.chat import Message  # type: ignore
         
         messages = [
-            Message(role="system", content=self.system_prompt),
-            Message(role="user", content=prompt),
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": prompt},
         ]
         
         resp = await self.llm.ask(messages=messages)

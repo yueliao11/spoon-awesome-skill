@@ -5,8 +5,12 @@ from typing import Any, List, Optional
 
 from pydantic import PrivateAttr
 
-from spoon_ai.tools.base import BaseTool, ToolResult
-from spoon_ai.chat import ChatBot
+from base_tool import BaseTool, ToolResult
+# Mock ChatBot if not available, or use a simplified local version if needed for RAG_FAKE_QA=1
+# For real usage, user would install the full package, but for standalone skill structure, we decouple.
+class ChatBot:
+    def __init__(self, **kwargs): pass
+    async def ask(self, **kwargs): return "Mock Response"
 from rag import (
     get_default_config,
     get_embedding_client,

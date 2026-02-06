@@ -93,12 +93,25 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
     def embed(self, texts: Iterable[str]) -> List[List[float]]:
         # OpenAI-compatible; use the same /embeddings route
         url = f"{self.base_url}/embeddings"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
+        # Ensure ascii for headers
+        # Sanitize API key to remove potential hidden characters like line separator \u2028
+        clean_key = self.api_key.strip()
+        # Remove common invisible unicode characters if present
+        for char in ('\u200b', '\u2028', '\u2029'):
+            clean_key = clean_key.replace(char, '')
+            
+        safe_headers = {
+            "Authorization": f"Bearer {clean_key}",
             "Content-Type": "application/json",
         }
         if self.custom_headers:
-            headers.update(self.custom_headers)
+            for k, v in self.custom_headers.items():
+                if isinstance(v, str):
+                    try:
+                        v.encode('latin-1') # http headers must be latin-1 encodable
+                        safe_headers[k] = v
+                    except UnicodeEncodeError:
+                        pass # skip non-latin-1 headers
         
         # OpenAI-compatible limits (conservative defaults):
         # - Max tokens per text: varies by service, use 8k tokens as safe default
@@ -122,7 +135,7 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
             payload = {"input": batch}
             if self.model:
                 payload["model"] = self.model
-            resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+            resp = requests.post(url, headers=safe_headers, data=json.dumps(payload), timeout=60)
             
             if resp.status_code != 200:
                 try:
@@ -370,28 +383,17 @@ def get_embedding_client(
         # order (OpenAI > OpenRouter > Gemini). This is intentionally independent from
         # the chat LLM provider and its fallback chain.
         # Note: DeepSeek does not support embeddings API, so it's excluded from auto-selection.
-        try:
-            from spoon_ai.llm.config import ConfigurationManager
-
-            cm = ConfigurationManager()
-            available = set(cm.list_configured_providers())
-            for p in ("openai", "openrouter", "gemini"):
-                if p in available:
-                    provider_norm = p
-                    break
-
-            # Finally, allow a custom OpenAI-compatible embeddings endpoint if explicitly configured.
-            # This is checked after Gemini to match the desired priority.
-            if provider_norm in ("", "auto") and os.getenv("RAG_EMBEDDINGS_BASE_URL"):
-                try:
-                    cm.load_provider_config("rag_embeddings")
-                except Exception:
-                    pass
-                else:
-                    provider_norm = "openai_compatible"
-        except Exception:
-            # If core config is unavailable/misconfigured, fall back to offline embeddings.
-            provider_norm = "hash"
+        
+        if os.getenv("OPENAI_API_KEY"):
+            provider_norm = "openai"
+        elif os.getenv("OPENROUTER_API_KEY"):
+            provider_norm = "openrouter"
+        elif os.getenv("GEMINI_API_KEY"):
+            provider_norm = "gemini"
+            
+        # Finally, allow a custom OpenAI-compatible embeddings endpoint if explicitly configured.
+        if provider_norm in ("", "auto") and os.getenv("RAG_EMBEDDINGS_BASE_URL"):
+             provider_norm = "openai_compatible"
 
     supported = {"", "auto", "hash", "openai", "openrouter", "gemini", "openai_compatible", "ollama"}
     if provider_norm not in supported:
@@ -405,17 +407,9 @@ def get_embedding_client(
         return HashEmbeddingClient()
 
     if provider_norm == "openai":
-        # Use core provider config to honor env priority and base_url overrides.
-        try:
-            from spoon_ai.llm.config import ConfigurationManager
-
-            cm = ConfigurationManager()
-            cfg = cm.load_provider_config("openai")
-            key = openai_api_key or cfg.api_key
-            base_url = cfg.base_url or "https://api.openai.com/v1"
-        except Exception:
-            key = openai_api_key or os.getenv("OPENAI_API_KEY")
-            base_url = os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        # Use simple env vars to avoid dependency on spoon_ai.llm
+        key = openai_api_key or os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
 
         if not key:
             raise ValueError("OPENAI_API_KEY not configured for OpenAI embeddings")
@@ -427,35 +421,32 @@ def get_embedding_client(
 
     if provider_norm == "openrouter":
         # OpenRouter is OpenAI-compatible for embeddings.
-        from spoon_ai.llm.config import ConfigurationManager
-
-        cm = ConfigurationManager()
-        cfg = cm.load_provider_config("openrouter")
-
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        base_url = os.getenv("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1"
+        
         # If OPENROUTER_MODEL is an embedding model, use it; otherwise default to OpenAI embeddings via OpenRouter.
-        if cfg.model and "embedding" in cfg.model.lower():
-            model_name = cfg.model
+        # Check env var for model override
+        env_model = os.getenv("OPENROUTER_MODEL")
+        if env_model and "embedding" in env_model.lower():
+            model_name = env_model
         else:
             model_name = _derive_openrouter_embedding_model(model)
 
-        if not cfg.api_key:
+        if not api_key:
             raise ValueError("OPENROUTER_API_KEY not configured for OpenRouter embeddings")
 
         return OpenAICompatibleEmbeddingClient(
-            api_key=cfg.api_key,
-            base_url=cfg.base_url or "https://openrouter.ai/api/v1",
+            api_key=api_key,
+            base_url=base_url,
             model=model_name,
-            custom_headers=cfg.custom_headers,
+            custom_headers={"HTTP-Referer": "https://spoon.ai", "X-Title": "SpoonAI"},
         )
 
     if provider_norm == "gemini":
         # Gemini embeddings are handled via google-genai SDK. The embedding model must be
         # provided via RAG_EMBEDDINGS_MODEL (passed as model parameter here).
-        from spoon_ai.llm.config import ConfigurationManager
-
-        cm = ConfigurationManager()
-        cfg = cm.load_provider_config("gemini")
-        if not cfg.api_key:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
             raise ValueError("GEMINI_API_KEY not configured for Gemini embeddings")
 
         model_name = (model or "").strip()
@@ -476,28 +467,20 @@ def get_embedding_client(
         # - RAG_EMBEDDINGS_API_KEY
         # - RAG_EMBEDDINGS_BASE_URL
         # - RAG_EMBEDDINGS_MODEL (optional; defaults to model parameter)
-        from spoon_ai.llm.config import ConfigurationManager
-
-        cm = ConfigurationManager()
-        try:
-            cfg = cm.load_provider_config("rag_embeddings")
-        except Exception as exc:
-            raise ValueError(
-                "RAG_EMBEDDINGS_API_KEY and RAG_EMBEDDINGS_BASE_URL must be set when "
-                "RAG_EMBEDDINGS_PROVIDER=openai_compatible."
-            ) from exc
-
-        if not cfg.base_url:
+        
+        api_key = os.getenv("RAG_EMBEDDINGS_API_KEY")
+        base_url = os.getenv("RAG_EMBEDDINGS_BASE_URL")
+        
+        if not base_url:
             raise ValueError(
                 "RAG_EMBEDDINGS_BASE_URL must be set when RAG_EMBEDDINGS_PROVIDER=openai_compatible."
             )
 
-        model_name = cfg.model or model
+        model_name = os.getenv("RAG_EMBEDDINGS_MODEL") or model
         return OpenAICompatibleEmbeddingClient(
-            api_key=cfg.api_key,
-            base_url=cfg.base_url,
+            api_key=api_key or "dummy",
+            base_url=base_url,
             model=model_name,
-            custom_headers=cfg.custom_headers,
         )
 
     if provider_norm == "deepseek":
